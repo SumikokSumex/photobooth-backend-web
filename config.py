@@ -25,7 +25,3 @@ NANO_BANANA_API_KEY = _require_env("NANO_BANANA_API_KEY")
 PUBLIC_BASE_URL = _require_env("PUBLIC_BASE_URL")
 
 ALLOWED_ORIGINS = _parse_allowed_origins()
-
-GOOGLE_SERVICE_ACCOUNT_FILE = Path(
-    os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials/service_account.json")
-).resolve()
