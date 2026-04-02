@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -12,10 +13,13 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 class GoogleDriveService:
     def __init__(self, parent_folder_id: str):
-        self.parent_folder_id = parent_folder_id
-        self.credentials_dir = Path("credentials")
-        self.oauth_client_file = self.credentials_dir / "oauth_client.json"
-        self.token_file = self.credentials_dir / "token.json"
+        self.parent_folder_id = parent_folder_id     
+        self.oauth_client_file = Path(
+            os.getenv("GOOGLE_OAUTH_CLIENT_FILE", "/etc/secrets/oauth_client.json")
+        )
+        self.token_file = Path(
+            os.getenv("GOOGLE_TOKEN_FILE", "/etc/secrets/token.json")
+        )
         self.service = build("drive", "v3", credentials=self._get_credentials())
 
     def _get_credentials(self):
