@@ -220,6 +220,9 @@ def get_session_status(session_id: str):
                 session_dir = get_session_dir(session_id)
                 ai_result_path = session_dir / "final_result.jpg"
 
+                print(f"[SESSION {session_id}] NanoBanana success. result_image_url={result_image_url}")
+                print(f"[SESSION {session_id}] Mulai download hasil AI ke {ai_result_path}")
+
                 nanobanana_service.download_result_image(
                     image_url=result_image_url,
                     output_path=str(ai_result_path),
@@ -230,6 +233,9 @@ def get_session_status(session_id: str):
                 drive_folder_id = session_info.get("drive_folder_id")
                 if not drive_folder_id:
                     raise Exception(f"drive_folder_id tidak ditemukan untuk session {session_id}")
+
+                print(f"[SESSION {session_id}] Mulai upload final_result.jpg ke Google Drive")
+                print(f"[SESSION {session_id}] drive_folder_id={drive_folder_id}")
 
                 uploaded_ai_file = drive_service.upload_file_to_folder(
                     file_path=str(ai_result_path),
