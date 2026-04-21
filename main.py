@@ -3,6 +3,7 @@ from datetime import datetime
 import json
 import shutil
 import traceback
+import time
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -120,7 +121,78 @@ def finalize_ai_result_for_session(session_id: str, result_image_url: str) -> No
 
     save_session_info(session_id, session_info)
 
+def poll_nanobanana_until_done(session_id: str, task_id: str) -> None:
+    print(f"[SESSION {session_id}] Background polling dimulai untuk task {task_id}")
 
+    nanobanana_service = NanoBananaService()
+
+    max_attempts = 90
+    sleep_seconds = 8
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            task_result = nanobanana_service.get_task_details(task_id)
+
+            print(f"=== BACKGROUND POLLING TASK RESULT | SESSION {session_id} | ATTEMPT {attempt} ===")
+            print(json.dumps(task_result, ensure_ascii=False, indent=2))
+
+            task_data = task_result.get("data", {}) or {}
+            success_flag = task_data.get("successFlag")
+            response_data = task_data.get("response") or {}
+            result_image_url = response_data.get("resultImageUrl")
+            error_code = task_data.get("errorCode")
+            error_message = task_data.get("errorMessage") or task_result.get("msg")
+
+            session_info = load_session_info(session_id)
+
+            if success_flag == 1 and result_image_url:
+                finalize_ai_result_for_session(session_id, result_image_url)
+                print(f"[SESSION {session_id}] Background polling selesai: success")
+                return
+
+            if success_flag in (2, 3):
+                session_info["nanobanana_status"] = "failed"
+                session_info["nanobanana_error_message"] = (
+                    error_message or f"NanoBanana gagal dengan errorCode={error_code}"
+                )
+                save_session_info(session_id, session_info)
+                print(
+                    f"[SESSION {session_id}] Background polling selesai: failed - "
+                    f"{session_info['nanobanana_error_message']}"
+                )
+                return
+
+            session_info["nanobanana_status"] = "queued"
+            session_info["nanobanana_error_message"] = None
+            save_session_info(session_id, session_info)
+
+        except Exception as e:
+            traceback.print_exc()
+            try:
+                session_info = load_session_info(session_id)
+                session_info["nanobanana_status"] = "failed"
+                session_info["nanobanana_error_message"] = f"{type(e).__name__}: {str(e)}"
+                save_session_info(session_id, session_info)
+            except Exception:
+                pass
+
+            print(f"[SESSION {session_id}] Background polling error: {type(e).__name__}: {str(e)}")
+            return
+
+        time.sleep(sleep_seconds)
+
+    try:
+        session_info = load_session_info(session_id)
+        session_info["nanobanana_status"] = "failed"
+        session_info["nanobanana_error_message"] = (
+            f"Timeout: task NanoBanana tidak selesai setelah {max_attempts * sleep_seconds} detik"
+        )
+        save_session_info(session_id, session_info)
+    except Exception:
+        pass
+
+    print(f"[SESSION {session_id}] Background polling timeout")
+    
 def process_nanobanana_callback(payload: dict) -> None:
     try:
         print("=== NANO BANANA CALLBACK PAYLOAD ===")
@@ -241,6 +313,7 @@ def get_prompt_catalog():
 
 @app.post("/upload-photo")
 async def upload_photo(
+    background_tasks: BackgroundTasks,
     photo: UploadFile = File(...),
     prompt_title: str = Form(...),
     prompt_text: str = Form(...),
@@ -306,6 +379,12 @@ async def upload_photo(
         }
 
         save_session_info(session_id, session_info)
+
+        background_tasks.add_task(
+            poll_nanobanana_until_done,
+            session_id,
+            nanobanana_task["task_id"],
+        )
 
         return {
             "success": True,
