@@ -4,7 +4,7 @@ import json
 import shutil
 import traceback
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import ALLOWED_ORIGINS, GOOGLE_DRIVE_PARENT_FOLDER_ID
@@ -38,7 +38,9 @@ def get_session_info_path(session_id: str) -> Path:
 def load_session_info(session_id: str) -> dict:
     session_info_path = get_session_info_path(session_id)
     if not session_info_path.exists():
-        raise FileNotFoundError(f"session_info.json tidak ditemukan untuk session {session_id}")
+        raise FileNotFoundError(
+            f"session_info.json tidak ditemukan untuk session {session_id}"
+        )
 
     with session_info_path.open("r", encoding="utf-8") as file:
         return json.load(file)
@@ -51,6 +53,151 @@ def save_session_info(session_id: str, data: dict) -> None:
     session_info_path = get_session_info_path(session_id)
     with session_info_path.open("w", encoding="utf-8") as file:
         json.dump(data, file, ensure_ascii=False, indent=2)
+
+
+def find_session_id_by_task_id(task_id: str) -> str | None:
+    for info_file in UPLOAD_DIR.glob("*/session_info.json"):
+        try:
+            with info_file.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+
+            if data.get("nanobanana_task_id") == task_id:
+                return info_file.parent.name
+        except Exception:
+            continue
+
+    return None
+
+
+def finalize_ai_result_for_session(session_id: str, result_image_url: str) -> None:
+    session_info = load_session_info(session_id)
+
+    if session_info.get("drive_ai_result_file_id"):
+        print(
+            f"[SESSION {session_id}] Final AI sudah pernah diupload, skip duplicate process"
+        )
+        return
+
+    session_dir = get_session_dir(session_id)
+    ai_result_path = session_dir / "final_result.jpg"
+
+    print(f"[SESSION {session_id}] NanoBanana success. result_image_url={result_image_url}")
+    print(f"[SESSION {session_id}] Mulai download hasil AI ke {ai_result_path}")
+
+    nanobanana_service = NanoBananaService()
+    nanobanana_service.download_result_image(
+        image_url=result_image_url,
+        output_path=str(ai_result_path),
+    )
+
+    drive_service = GoogleDriveService(
+        parent_folder_id=GOOGLE_DRIVE_PARENT_FOLDER_ID
+    )
+
+    drive_folder_id = session_info.get("drive_folder_id")
+    if not drive_folder_id:
+        raise Exception(f"drive_folder_id tidak ditemukan untuk session {session_id}")
+
+    print(f"[SESSION {session_id}] Mulai upload final_result.jpg ke Google Drive")
+    print(f"[SESSION {session_id}] drive_folder_id={drive_folder_id}")
+
+    uploaded_ai_file = drive_service.upload_file_to_folder(
+        file_path=str(ai_result_path),
+        filename="final_result.jpg",
+        folder_id=drive_folder_id,
+    )
+
+    print(
+        f"[SESSION {session_id}] Upload final_result.jpg berhasil. "
+        f"file_id={uploaded_ai_file['id']}"
+    )
+
+    session_info["nanobanana_status"] = "success"
+    session_info["nanobanana_error_message"] = None
+    session_info["nanobanana_result_image_url"] = result_image_url
+    session_info["drive_ai_result_file_id"] = uploaded_ai_file["id"]
+    session_info["drive_ai_result_file_url"] = uploaded_ai_file.get("webViewLink")
+
+    save_session_info(session_id, session_info)
+
+
+def process_nanobanana_callback(payload: dict) -> None:
+    try:
+        print("=== NANO BANANA CALLBACK PAYLOAD ===")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        code = payload.get("code")
+        msg = payload.get("msg")
+        data = payload.get("data", {}) or {}
+
+        task_id = data.get("taskId")
+        response_data = data.get("response") or {}
+        info_data = data.get("info") or {}
+
+        result_image_url = (
+            response_data.get("resultImageUrl")
+            or info_data.get("resultImageUrl")
+        )
+
+        error_message = data.get("errorMessage") or msg
+        success_flag = data.get("successFlag")
+        error_code = data.get("errorCode")
+
+        if not task_id:
+            print("Callback NanoBanana tidak mengandung taskId")
+            return
+
+        session_id = find_session_id_by_task_id(task_id)
+        if not session_id:
+            print(f"Tidak menemukan session untuk taskId {task_id}")
+            return
+
+        session_info = load_session_info(session_id)
+
+        if code != 200 or success_flag in (2, 3):
+            session_info["nanobanana_status"] = "failed"
+            session_info["nanobanana_error_message"] = (
+                error_message or f"NanoBanana gagal dengan errorCode={error_code}"
+            )
+            save_session_info(session_id, session_info)
+            print(
+                f"[SESSION {session_id}] NanoBanana gagal: "
+                f"{session_info['nanobanana_error_message']}"
+            )
+            return
+
+        if success_flag != 1:
+            session_info["nanobanana_status"] = "queued"
+            session_info["nanobanana_error_message"] = None
+            save_session_info(session_id, session_info)
+            print(f"[SESSION {session_id}] Callback datang tetapi task belum final")
+            return
+
+        if not result_image_url:
+            session_info["nanobanana_status"] = "failed"
+            session_info["nanobanana_error_message"] = "resultImageUrl kosong"
+            save_session_info(session_id, session_info)
+            print(f"[SESSION {session_id}] Callback sukses tapi resultImageUrl kosong")
+            return
+
+        finalize_ai_result_for_session(session_id, result_image_url)
+
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            data = payload.get("data", {}) or {}
+            task_id = data.get("taskId")
+            if task_id:
+                session_id = find_session_id_by_task_id(task_id)
+                if session_id:
+                    session_info = load_session_info(session_id)
+                    session_info["nanobanana_status"] = "failed"
+                    session_info["nanobanana_error_message"] = (
+                        f"{type(e).__name__}: {str(e)}"
+                    )
+                    save_session_info(session_id, session_info)
+        except Exception:
+            pass
 
 
 @app.get("/")
@@ -113,7 +260,9 @@ async def upload_photo(
         with original_path.open("wb") as buffer:
             shutil.copyfileobj(photo.file, buffer)
 
-        drive_service = GoogleDriveService(parent_folder_id=GOOGLE_DRIVE_PARENT_FOLDER_ID)
+        drive_service = GoogleDriveService(
+            parent_folder_id=GOOGLE_DRIVE_PARENT_FOLDER_ID
+        )
 
         drive_folder = drive_service.create_session_folder(session_id=session_id)
 
@@ -201,68 +350,51 @@ def get_session_status(session_id: str):
                 "data": session_info,
             }
 
+        if session_info.get("drive_ai_result_file_id"):
+            session_info["nanobanana_status"] = "success"
+            save_session_info(session_id, session_info)
+            return {
+                "success": True,
+                "session_id": session_id,
+                "data": session_info,
+            }
+
         nanobanana_service = NanoBananaService()
         task_result = nanobanana_service.get_task_details(task_id)
 
         print("=== NANO BANANA TASK RESULT ===")
         print(json.dumps(task_result, ensure_ascii=False, indent=2))
 
-        task_data = task_result.get("data", {})
+        task_data = task_result.get("data", {}) or {}
         success_flag = task_data.get("successFlag")
         response_data = task_data.get("response") or {}
-
         result_image_url = response_data.get("resultImageUrl")
         error_code = task_data.get("errorCode")
         error_message = task_data.get("errorMessage") or task_result.get("msg")
 
-        if success_flag == 1:
-            if result_image_url and session_info.get("drive_ai_result_file_id") is None:
-                session_dir = get_session_dir(session_id)
-                ai_result_path = session_dir / "final_result.jpg"
-
-                print(f"[SESSION {session_id}] NanoBanana success. result_image_url={result_image_url}")
-                print(f"[SESSION {session_id}] Mulai download hasil AI ke {ai_result_path}")
-
-                nanobanana_service.download_result_image(
-                    image_url=result_image_url,
-                    output_path=str(ai_result_path),
+        if success_flag == 1 and result_image_url:
+            try:
+                finalize_ai_result_for_session(session_id, result_image_url)
+                session_info = load_session_info(session_id)
+            except Exception as finalize_error:
+                traceback.print_exc()
+                session_info["nanobanana_status"] = "failed"
+                session_info["nanobanana_error_message"] = (
+                    f"{type(finalize_error).__name__}: {str(finalize_error)}"
                 )
-
-                drive_service = GoogleDriveService(parent_folder_id=GOOGLE_DRIVE_PARENT_FOLDER_ID)
-
-                drive_folder_id = session_info.get("drive_folder_id")
-                if not drive_folder_id:
-                    raise Exception(f"drive_folder_id tidak ditemukan untuk session {session_id}")
-
-                print(f"[SESSION {session_id}] Mulai upload final_result.jpg ke Google Drive")
-                print(f"[SESSION {session_id}] drive_folder_id={drive_folder_id}")
-
-                uploaded_ai_file = drive_service.upload_file_to_folder(
-                    file_path=str(ai_result_path),
-                    filename="final_result.jpg",
-                    folder_id=drive_folder_id,
-                )
-
-                session_info["nanobanana_status"] = "success"
-                session_info["nanobanana_error_message"] = None
-                session_info["nanobanana_result_image_url"] = result_image_url
-                session_info["drive_ai_result_file_id"] = uploaded_ai_file["id"]
-                session_info["drive_ai_result_file_url"] = uploaded_ai_file.get("webViewLink")
-            else:
-                session_info["nanobanana_status"] = "success"
-                session_info["nanobanana_error_message"] = None
-                session_info["nanobanana_result_image_url"] = result_image_url
+                save_session_info(session_id, session_info)
 
         elif success_flag in (2, 3):
             session_info["nanobanana_status"] = "failed"
             session_info["nanobanana_error_message"] = (
                 error_message or f"NanoBanana gagal dengan errorCode={error_code}"
             )
+            save_session_info(session_id, session_info)
+
         else:
             session_info["nanobanana_status"] = "queued"
             session_info["nanobanana_error_message"] = None
-
-        save_session_info(session_id, session_info)
+            save_session_info(session_id, session_info)
 
         return {
             "success": True,
@@ -284,5 +416,6 @@ def get_session_status(session_id: str):
 
 
 @app.post("/nanobanana/callback")
-async def nanobanana_callback():
+async def nanobanana_callback(payload: dict, background_tasks: BackgroundTasks):
+    background_tasks.add_task(process_nanobanana_callback, payload)
     return {"status": "received"}
